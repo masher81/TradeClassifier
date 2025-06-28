@@ -90,9 +90,25 @@ def main():
     try:
         while True:
             now = datetime.utcnow()
+
             # heartbeat
             sys.stdout.write(f"\n[{now.isoformat()}] scanning {len(BEST)} symbols; open positions: {len(positions)}\n")
-            sys.stdout.flush()
+            # print time-to-exit for each open position
+            if positions:
+                sys.stdout.write("Open positions time-to-exit:\n")
+                for sym, pos in positions.items():
+                    exit_dt = pos['exit_time']
+                    # convert pandas.Timestamp if needed
+                    if hasattr(exit_dt, "to_pydatetime"):
+                        exit_dt = exit_dt.to_pydatetime()
+                    delta = exit_dt - now
+                    if delta.total_seconds() > 0:
+                        hrs, rem = divmod(int(delta.total_seconds()), 3600)
+                        mins, secs = divmod(rem, 60)
+                        sys.stdout.write(f"  {sym}: {hrs}h{mins}m{secs}s\n")
+                    else:
+                        sys.stdout.write(f"  {sym}: EXIT TIME PASSED\n")
+                sys.stdout.flush()
 
             for symbol, params in tqdm(BEST.items(), desc="symbols", leave=False):
                 # read params
@@ -140,7 +156,6 @@ def main():
                         'exit_price':  f"{exit_price:.4f}",
                         'pnl':         f"{pnl:.2f}",
                     })
-
                     del positions[symbol]
 
                 # ENTER
@@ -156,7 +171,6 @@ def main():
                     else:
                         exchange.create_order(symbol, 'market', 'buy', qty)
 
-                    # record in positions
                     positions[symbol] = {
                         'entry_time':   timestamp,
                         'entry_price':  entry_price,
@@ -183,7 +197,6 @@ def main():
             # end of one full scan
             sys.stdout.write(f"[{datetime.utcnow().isoformat()}] scan complete.\n")
             sys.stdout.flush()
-
             sleep_till_next()
 
     except KeyboardInterrupt:
@@ -191,5 +204,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
