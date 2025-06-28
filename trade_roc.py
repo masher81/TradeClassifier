@@ -21,6 +21,7 @@ SLIPPAGE_PCT = float(os.getenv('SLIPPAGE_PCT', 0.0005)) # 0.05% round-trip
 DRY_RUN      = os.getenv('DRY_RUN', 'false').lower() in ('1', 'true')
 THRESHOLD    = float(os.getenv('CLASSIFIER_THRESHOLD', 0.40))
 LOG_FILE     = os.getenv('TRADE_LOG_FILE', 'trade_log.csv')
+POS_FILE     = os.getenv('POSITIONS_FILE', 'open_positions.json')
 
 # ensure log file exists with header
 if not os.path.exists(LOG_FILE):
@@ -48,10 +49,48 @@ exchange  = ccxt.kraken({
 })
 exchange.load_markets()
 
-# track open positions: symbol → {
-#    'entry_time','entry_price','qty','roc','exit_time'
-# }
-positions = {}
+# ─────────────── PERSISTENT POSITIONS ──────────────────────────────
+
+def load_positions():
+    """Load open positions from disk (if any)."""
+    if not os.path.exists(POS_FILE):
+        return {}
+    try:
+        raw = json.load(open(POS_FILE))
+        pos = {}
+        for sym, p in raw.items():
+            # parse exit_time back to datetime
+            et = datetime.fromisoformat(p['exit_time'])
+            pos[sym] = {
+                'entry_time':  p['entry_time'],
+                'entry_price': float(p['entry_price']),
+                'qty':         float(p['qty']),
+                'roc':         float(p['roc']),
+                'exit_time':   et,
+            }
+        return pos
+    except Exception as e:
+        print(f"⚠️  Could not load positions file: {e}")
+        return {}
+
+def save_positions():
+    """Write current open positions to disk."""
+    out = {}
+    for sym, p in positions.items():
+        out[sym] = {
+            'entry_time':  p['entry_time'],
+            'entry_price': p['entry_price'],
+            'qty':         p['qty'],
+            'roc':         p['roc'],
+            'exit_time':   p['exit_time'].isoformat(),
+        }
+    with open(POS_FILE, 'w') as f:
+        json.dump(out, f, indent=2)
+
+# load at startup
+positions = load_positions()
+
+# ─────────────── UTILITIES ────────────────────────────────────────
 
 def fetch_bars(symbol, hours):
     """Fetch at least `hours+2` bars so we can compute ROC."""
@@ -85,23 +124,20 @@ def log_trade(row):
             row.get('pnl',''),
         ])
 
+# ─────────────── MAIN LOOP ─────────────────────────────────────────
+
 def main():
-    print(f"▶️  Starting ROC‐based trader...  Dry run={DRY_RUN}, classifier threshold={THRESHOLD}")
+    print(f"▶️  Starting ROC‐based trader...  Dry run={DRY_RUN}, threshold={THRESHOLD}")
     try:
         while True:
             now = datetime.utcnow()
 
-            # heartbeat
+            # heartbeat + time-to-exit display
             sys.stdout.write(f"\n[{now.isoformat()}] scanning {len(BEST)} symbols; open positions: {len(positions)}\n")
-            # print time-to-exit for each open position
             if positions:
                 sys.stdout.write("Open positions time-to-exit:\n")
                 for sym, pos in positions.items():
-                    exit_dt = pos['exit_time']
-                    # convert pandas.Timestamp if needed
-                    if hasattr(exit_dt, "to_pydatetime"):
-                        exit_dt = exit_dt.to_pydatetime()
-                    delta = exit_dt - now
+                    delta = pos['exit_time'] - now
                     if delta.total_seconds() > 0:
                         hrs, rem = divmod(int(delta.total_seconds()), 3600)
                         mins, secs = divmod(rem, 60)
@@ -116,7 +152,7 @@ def main():
                     roc_p  = int(params.get('roc', params.get('roc_period')))
                     thr    = float(params.get('threshold', params.get('thr')))
                     hold_h = int(params.get('hold', params.get('hold_bars')))
-                except Exception:
+                except:
                     print(f"⚠️  Skipping {symbol!r}, malformed params: {params}")
                     continue
 
@@ -137,12 +173,10 @@ def main():
                     pnl        = (exit_price - pos['entry_price']) * qty
                     timestamp  = now.isoformat()
                     print(f"{timestamp} ← EXIT {symbol:8} @ {exit_price:.4f}  qty={qty:.6f}  pnl={pnl:.2f}")
-                    if DRY_RUN:
-                        print(f"  [DRY_RUN] would SELL {symbol} qty={qty:.6f}")
-                    else:
+                    if not DRY_RUN:
                         exchange.create_order(symbol, 'market', 'sell', qty)
 
-                    # log exit
+                    # log & persist exit
                     log_trade({
                         'symbol':      symbol,
                         'action':      'EXIT',
@@ -157,6 +191,7 @@ def main():
                         'pnl':         f"{pnl:.2f}",
                     })
                     del positions[symbol]
+                    save_positions()
 
                 # ENTER
                 elif (symbol not in positions) and (roc > thr):
@@ -166,9 +201,7 @@ def main():
                     timestamp   = now.isoformat()
 
                     print(f"{timestamp} → ENTER{symbol:8} @ {entry_price:.4f}  qty={qty:.6f}  roc={roc:.4f}")
-                    if DRY_RUN:
-                        print(f"  [DRY_RUN] would BUY  {symbol} qty={qty:.6f}")
-                    else:
+                    if not DRY_RUN:
                         exchange.create_order(symbol, 'market', 'buy', qty)
 
                     positions[symbol] = {
@@ -178,6 +211,7 @@ def main():
                         'roc':          roc,
                         'exit_time':    exit_time,
                     }
+                    save_positions()
 
                     # log entry
                     log_trade({
@@ -194,16 +228,16 @@ def main():
                         'pnl':         '',
                     })
 
-            # end of one full scan
             sys.stdout.write(f"[{datetime.utcnow().isoformat()}] scan complete.\n")
             sys.stdout.flush()
             sleep_till_next()
 
     except KeyboardInterrupt:
-        print("📴  Stopping cleanly…")
+        print("\n📴  Stopping cleanly…")
 
 if __name__ == '__main__':
     main()
+
 
 
 
