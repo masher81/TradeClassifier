@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-trade_roc_sltp.py - Optimized Version
+trade_roc_sltp.py - Enhanced Visibility Version
 
 Key Improvements:
-1. Parallel symbol processing with ThreadPoolExecutor
-2. Two-level caching (raw data + processed DataFrames)
-3. Dynamic rate limiting
-4. Pre-filtering of illiquid symbols
-5. Optimized indicator calculations
+1. Detailed trading activity logging
+2. Market summary display
+3. Clear entry/exit signals
+4. Verbose debugging options
+5. Maintains all previous optimizations
 """
 
 import os
@@ -44,10 +44,18 @@ HISTORY_HOURS = 168  # 7 days
 MIN_AVG_VOLUME = 100  # Skip symbols with avg volume < this
 MAX_WORKERS = 5  # Thread count for parallel processing
 CACHE_FILE = 'data_cache.pkl'
+VERBOSE = True  # Set to False to reduce output
+MIN_ROC_DISPLAY = 0.01  # Only display ROC values above this threshold
+DEBUG_MODE = True  # Additional debug information
+
 # Load parameters
 with open('best_params.json') as f:
     BEST = json.load(f)
 SYMBOLS = list(BEST.keys())
+
+# For testing - uncomment to use only these symbols
+# TEST_SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD']
+# SYMBOLS = [s for s in TEST_SYMBOLS if s in BEST]
 
 # ─────────────── EXCHANGE SETUP ────────────────────────────────────────
 exchange = ccxt.kraken({
@@ -70,16 +78,19 @@ def load_persistent_cache():
             cache = joblib.load(f)
             RAW_CACHE.update(cache.get('raw', {}))
             PROCESSED_CACHE.update(cache.get('processed', {}))
-            print(f"Loaded cache with {len(RAW_CACHE)} raw and {len(PROCESSED_CACHE)} processed entries")
+            if VERBOSE:
+                print(f"♻️ Loaded cache with {len(RAW_CACHE)} raw and {len(PROCESSED_CACHE)} processed entries")
     except FileNotFoundError:
-        print("No cache file found - starting fresh")
+        if VERBOSE:
+            print("♻️ No cache file found - starting fresh")
 
 def save_persistent_cache():
     """Save cache to disk"""
     cache = {'raw': RAW_CACHE, 'processed': PROCESSED_CACHE}
     with open(CACHE_FILE, 'wb') as f:
         joblib.dump(cache, f)
-    print(f"Saved cache with {len(RAW_CACHE)} raw and {len(PROCESSED_CACHE)} processed entries")
+    if VERBOSE:
+        print(f"♻️ Saved cache with {len(RAW_CACHE)} raw and {len(PROCESSED_CACHE)} processed entries")
 
 # ─────────────── RATE LIMIT HANDLING ───────────────────────────────────
 def rate_limited_request():
@@ -89,7 +100,7 @@ def rate_limited_request():
     elapsed = now - last_request_time
     if elapsed < 1.0:  # Kraken's 1req/sec limit
         time.sleep(1.0 - elapsed)
-    last_request_time = time.time()
+    last_request_time = now
 
 # ─────────────── DATA LOADING ──────────────────────────────────────────
 def fetch_raw_data(symbol, hours=HISTORY_HOURS, max_retries=3):
@@ -115,7 +126,8 @@ def fetch_raw_data(symbol, hours=HISTORY_HOURS, max_retries=3):
             all_bars += chunk
             since = chunk[-1][0] + 1
         except Exception as e:
-            print(f"Error loading {symbol} (attempt {retries+1}): {e}")
+            if VERBOSE:
+                print(f"⚠️ Error loading {symbol} (attempt {retries+1}): {str(e)[:100]}")
             retries += 1
             time.sleep(5)
     
@@ -170,8 +182,19 @@ def load_history(symbol):
         PROCESSED_CACHE[symbol] = (datetime.utcnow(), df)
     return df
 
+# ─────────────── MARKET UTILITIES ──────────────────────────────────────
+def print_market_summary(history):
+    """Print quick market overview"""
+    print("\n📊 Market Summary:")
+    for sym, df in list(history.items())[:5]:  # Show first 5 symbols
+        if len(df) < 2:
+            continue
+        last_close = df['close'].iloc[-1]
+        change_pct = (df['close'].iloc[-1] / df['close'].iloc[-2] - 1) * 100
+        print(f"  {sym}: {last_close:.2f} ({change_pct:+.2f}%) | Vol: {df['vol'].iloc[-1]:.2f}")
+
 # ─────────────── TRADING LOGIC ────────────────────────────────────────
-def backtest_sltp(df, params, symbol):  # Added symbol parameter
+def backtest_sltp(df, params, symbol):
     """Optimized backtesting function"""
     roc_period = params['roc_period']
     threshold = params['threshold']
@@ -253,11 +276,10 @@ def log_trade(row):
         ])
 
 # ─────────────── MAIN TRAINING ────────────────────────────────────────
-print(f"→ Fetching historical data for {len(SYMBOLS)} symbols...")
-
 def train_model():
     """Train the classifier with parallel data loading"""
-    load_persistent_cache()  # Load existing cache
+    print(f"→ Fetching historical data for {len(SYMBOLS)} symbols...")
+    load_persistent_cache()
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(load_history, sym): sym for sym in SYMBOLS}
@@ -270,19 +292,23 @@ def train_model():
                 if df is not None and len(df) >= MIN_DATA_BARS and df['vol'].mean() >= MIN_AVG_VOLUME:
                     history[sym] = df
             except Exception as e:
-                print(f"Error processing {sym}: {e}")
+                if VERBOSE:
+                    print(f"⚠️ Error processing {sym}: {str(e)[:100]}")
     
-    save_persistent_cache()  # Save updated cache
+    save_persistent_cache()
+    
+    if DEBUG_MODE:
+        print_market_summary(history)
     
     # Backtest all symbols
     all_trades = []
     for sym, df in tqdm(history.items(), desc="Backtesting"):
-        trades = backtest_sltp(df, BEST[sym], sym)  # Added symbol parameter
+        trades = backtest_sltp(df, BEST[sym], sym)
         if not trades.empty:
             all_trades.append(trades)
     
     if not all_trades:
-        raise ValueError("No trades generated during backtesting")
+        raise ValueError("⚠️ No trades generated during backtesting")
     
     # Prepare features
     feat_rows = []
@@ -320,27 +346,43 @@ def train_model():
     # Save models
     joblib.dump(scaler, 'scaler.pkl')
     joblib.dump(model, 'classifier.pkl')
+    
+    if DEBUG_MODE:
+        print("\n🔍 Debug Info:")
+        print(f"Current ROC Thresholds: {[p['threshold'] for p in BEST.values()][:5]}...")
+        print(f"Classifier Threshold: {CLASSIFIER_THRESHOLD}")
+        print(f"Sample Features:\n{feat_df.head(3)}")
+    
     return scaler, model
-
-scaler, model = train_model()
-print("\n→ Training complete. Starting live trading...")
 
 # ─────────────── LIVE TRADING ─────────────────────────────────────────
 def process_symbol(symbol, positions):
     """Process a single symbol in parallel"""
     try:
         df = load_history(symbol)
-        if df is None or len(df) < MIN_DATA_BARS or df['vol'].mean() < MIN_AVG_VOLUME:
+        if df is None:
+            if VERBOSE: print(f"⚠️ {symbol}: No data")
+            return None
+        if len(df) < MIN_DATA_BARS:
+            if VERBOSE: print(f"⚠️ {symbol}: Insufficient data ({len(df)} bars)")
+            return None
+        if df['vol'].mean() < MIN_AVG_VOLUME:
+            if VERBOSE: print(f"⚠️ {symbol}: Low volume ({df['vol'].mean():.1f})")
             return None
         
         params = BEST[symbol]
         roc_period = params['roc_period']
         if len(df) < roc_period + 1:
+            if VERBOSE: print(f"⚠️ {symbol}: Not enough data for ROC period")
             return None
             
         now = datetime.utcnow()
         close = df['close'].iloc[-1]
         roc = close / df['close'].iloc[-1-roc_period] - 1
+        
+        # Only display significant ROC values
+        if abs(roc) > MIN_ROC_DISPLAY and VERBOSE:
+            print(f"  {symbol}: ROC={roc:.2%} (Threshold: {params['threshold']:.2%})")
         
         # Exit checks
         if symbol in positions:
@@ -359,12 +401,15 @@ def process_symbol(symbol, positions):
                 pnl = (exit_adj - pos['entry_price']) * pos['qty']
                 hold_hours = (now - pos['entry_time']).total_seconds() / 3600
                 
+                print(f"\n🚀 {symbol} EXIT ({exit_type}) @ {exit_price:.4f} "
+                      f"| PnL: {pnl:.2f} | Held: {hold_hours:.1f}h")
+                
                 if not DRY_RUN:
                     try:
                         rate_limited_request()
                         exchange.create_order(symbol, 'market', 'sell', pos['qty'])
                     except Exception as e:
-                        print(f"Exit order failed: {e}")
+                        print(f"❌ Exit order failed: {e}")
                         return None
                 
                 log_trade({
@@ -401,16 +446,23 @@ def process_symbol(symbol, positions):
             }
             
             proba = model.predict_proba(scaler.transform(pd.DataFrame([feat])))[0, 1]
+            
+            if VERBOSE and roc > params['threshold']:
+                print(f"  {symbol}: ROC={roc:.2%} | Prob={proba:.2f} (Need {CLASSIFIER_THRESHOLD})")
+            
             if proba >= CLASSIFIER_THRESHOLD:
                 entry_adj = close * (1 + FEE_RATE + SLIPPAGE_PCT/2)
                 qty = NOTIONAL / entry_adj
+                
+                print(f"\n✅ {symbol} ENTER @ {close:.4f} (Qty: {qty:.4f}) "
+                      f"| ROC: {roc:.2%} | Prob: {proba:.2f}")
                 
                 if not DRY_RUN:
                     try:
                         rate_limited_request()
                         exchange.create_order(symbol, 'market', 'buy', qty)
                     except Exception as e:
-                        print(f"Entry order failed: {e}")
+                        print(f"❌ Entry order failed: {e}")
                         return None
                 
                 positions[symbol] = {
@@ -430,8 +482,13 @@ def process_symbol(symbol, positions):
                     'entry_price': f"{close:.4f}",
                 })
                 return "ENTER"
+            elif VERBOSE:
+                print(f"⛔ {symbol}: Prob {proba:.2f} < {CLASSIFIER_THRESHOLD} threshold")
+        elif VERBOSE and roc <= params['threshold']:
+            print(f"⛔ {symbol}: ROC {roc:.2%} <= {params['threshold']:.2%} threshold")
+            
     except Exception as e:
-        print(f"Error processing {symbol}: {e}")
+        print(f"❌ Error processing {symbol}: {str(e)[:200]}")
     return None
 
 def live_trading_loop():
@@ -439,15 +496,24 @@ def live_trading_loop():
     positions = {}
     print(f"\n▶️ Starting live trader (SL/TP version) - Dry run={DRY_RUN}")
     
+    # Initial market snapshot
+    initial_data = {}
+    for sym in SYMBOLS[:5]:  # Just load a few for the snapshot
+        if df := load_history(sym):
+            initial_data[sym] = df
+    print_market_summary(initial_data)
+    
     try:
         while True:
             cycle_start = time.time()
-            print(f"\n[{datetime.utcnow()}] Open positions: {len(positions)}")
+            print(f"\n⏳ [{datetime.utcnow()}] Open positions: {len(positions)}")
             
             # Refresh cache every 15 minutes
             if datetime.utcnow().minute % 15 == 0:
                 RAW_CACHE.clear()
                 PROCESSED_CACHE.clear()
+                if VERBOSE:
+                    print("♻️ Cache cleared")
             
             # Process all symbols in parallel
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -458,10 +524,14 @@ def live_trading_loop():
             # Sleep until next candle
             elapsed = time.time() - cycle_start
             sleep_time = max(60 - elapsed, 1)
+            if VERBOSE: 
+                print(f"💤 Sleeping {sleep_time:.1f}s until next candle")
             time.sleep(sleep_time)
             
     except KeyboardInterrupt:
-        print("\n� Stopped cleanly")
+        print("\n🛑 Stopped cleanly")
 
 if __name__ == "__main__":
+    scaler, model = train_model()
+    print("\n→ Training complete. Starting live trading...")
     live_trading_loop()
