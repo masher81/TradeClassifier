@@ -43,7 +43,7 @@ MIN_DATA_BARS = 100
 HISTORY_HOURS = 168  # 7 days
 MIN_AVG_VOLUME = 100  # Skip symbols with avg volume < this
 MAX_WORKERS = 5  # Thread count for parallel processing
-
+CACHE_FILE = 'data_cache.pkl'
 # Load parameters
 with open('best_params.json') as f:
     BEST = json.load(f)
@@ -62,6 +62,24 @@ RAW_CACHE = {}
 PROCESSED_CACHE = {}
 CACHE_EXPIRY = timedelta(minutes=15)
 last_request_time = 0
+
+def load_persistent_cache():
+    """Load cached data from disk"""
+    try:
+        with open(CACHE_FILE, 'rb') as f:
+            cache = joblib.load(f)
+            RAW_CACHE.update(cache.get('raw', {}))
+            PROCESSED_CACHE.update(cache.get('processed', {}))
+            print(f"Loaded cache with {len(RAW_CACHE)} raw and {len(PROCESSED_CACHE)} processed entries")
+    except FileNotFoundError:
+        print("No cache file found - starting fresh")
+
+def save_persistent_cache():
+    """Save cache to disk"""
+    cache = {'raw': RAW_CACHE, 'processed': PROCESSED_CACHE}
+    with open(CACHE_FILE, 'wb') as f:
+        joblib.dump(cache, f)
+    print(f"Saved cache with {len(RAW_CACHE)} raw and {len(PROCESSED_CACHE)} processed entries")
 
 # ─────────────── RATE LIMIT HANDLING ───────────────────────────────────
 def rate_limited_request():
@@ -153,7 +171,7 @@ def load_history(symbol):
     return df
 
 # ─────────────── TRADING LOGIC ────────────────────────────────────────
-def backtest_sltp(df, params):
+def backtest_sltp(df, params, symbol):  # Added symbol parameter
     """Optimized backtesting function"""
     roc_period = params['roc_period']
     threshold = params['threshold']
@@ -239,6 +257,8 @@ print(f"→ Fetching historical data for {len(SYMBOLS)} symbols...")
 
 def train_model():
     """Train the classifier with parallel data loading"""
+    load_persistent_cache()  # Load existing cache
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(load_history, sym): sym for sym in SYMBOLS}
         history = {}
@@ -252,10 +272,12 @@ def train_model():
             except Exception as e:
                 print(f"Error processing {sym}: {e}")
     
+    save_persistent_cache()  # Save updated cache
+    
     # Backtest all symbols
     all_trades = []
     for sym, df in tqdm(history.items(), desc="Backtesting"):
-        trades = backtest_sltp(df, BEST[sym])
+        trades = backtest_sltp(df, BEST[sym], sym)  # Added symbol parameter
         if not trades.empty:
             all_trades.append(trades)
     
@@ -439,7 +461,7 @@ def live_trading_loop():
             time.sleep(sleep_time)
             
     except KeyboardInterrupt:
-        print("\n🛑 Stopped cleanly")
+        print("\n� Stopped cleanly")
 
 if __name__ == "__main__":
     live_trading_loop()
