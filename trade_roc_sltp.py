@@ -70,7 +70,19 @@ RAW_CACHE = {}
 PROCESSED_CACHE = {}
 CACHE_EXPIRY = timedelta(minutes=15)
 last_request_time = 0
-
+def validate_cache():
+    """Ensure cache is fresh and valid"""
+    global RAW_CACHE, PROCESSED_CACHE
+    now = datetime.utcnow()
+    
+    # Remove expired entries
+    RAW_CACHE = {k: v for k, v in RAW_CACHE.items() 
+                if now - v[0] < CACHE_EXPIRY}
+    PROCESSED_CACHE = {k: v for k, v in PROCESSED_CACHE.items() 
+                      if now - v[0] < CACHE_EXPIRY}
+    
+    if VERBOSE:
+        print(f"♻️ Validated cache - {len(RAW_CACHE)} raw, {len(PROCESSED_CACHE)} processed entries")
 def load_persistent_cache():
     """Load cached data from disk"""
     try:
