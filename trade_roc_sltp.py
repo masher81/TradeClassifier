@@ -378,7 +378,7 @@ def process_symbol(symbol, positions):
                 'tp_pct': params['tp_pct'],
             }
             
-            proba = model.predict_proba(scaler.transform(pd.DataFrame([feat]))[0, 1]
+            proba = model.predict_proba(scaler.transform(pd.DataFrame([feat])))[0, 1]
             if proba >= CLASSIFIER_THRESHOLD:
                 entry_adj = close * (1 + FEE_RATE + SLIPPAGE_PCT/2)
                 qty = NOTIONAL / entry_adj
