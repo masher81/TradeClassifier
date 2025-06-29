@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-trade_roc_2res_full.py
+trade_roc_sltp_full.py
 
 2-resolution live trader:
   • 1 h ROC + classifier filter for entries
@@ -284,90 +284,119 @@ def process_symbol(symbol):
     2) Else, check 1 h ROC + classifier entry
     """
     global positions
-
     params = BEST[symbol]
 
-    # ─ Exit on 5 m
+    # ─── EXIT on 5 m ──────────────────────────────────────────────────────
     if symbol in positions:
         t5, close5 = fetch_latest_5m(symbol)
-        if t5 and close5 is not None:
+        if t5 is not None and close5 is not None:
             entry = positions[symbol]
-            tp_lvl = entry['entry_price']*(1+params['tp_pct'])
-            sl_lvl = entry['entry_price']*(1-params['sl_pct'])
+            tp_lvl = entry['entry_price'] * (1 + params['tp_pct'])
+            sl_lvl = entry['entry_price'] * (1 - params['sl_pct'])
             etype = None
+
             if close5 >= tp_lvl:
                 etype = 'TP'
             elif close5 <= sl_lvl:
                 etype = 'SL'
+
             if etype:
-                adj_exit = close5*(1-FEE_RATE-SLIPPAGE_PCT/2)
-                pnl      = (adj_exit - entry['entry_price'])*entry['qty']
+                adj_exit = close5 * (1 - FEE_RATE - SLIPPAGE_PCT/2)
+                pnl      = (adj_exit - entry['entry_price']) * entry['qty']
                 ts       = t5.isoformat()
                 print(f"{ts} ← EXIT {symbol} @ {adj_exit:.4f} ({etype})  pnl={pnl:.2f}")
+
                 if not DRY_RUN:
-                    exchange.create_order(symbol,'market','sell', entry['qty'])
+                    exchange.create_order(symbol, 'market', 'sell', entry['qty'])
+
                 log_trade({
-                    'symbol':symbol,'action':'EXIT','timestamp':ts,
-                    'price':f"{adj_exit:.4f}",'qty':f"{entry['qty']:.6f}",
-                    'roc':'','prob':'',
-                    'entry_time':entry['entry_time'].isoformat(),
+                    'symbol':     symbol,
+                    'action':     'EXIT',
+                    'timestamp':  ts,
+                    'price':      f"{adj_exit:.4f}",
+                    'qty':        f"{entry['qty']:.6f}",
+                    'roc':        '',
+                    'prob':       '',
+                    'entry_time': entry['entry_time'].isoformat(),
                     'entry_price':f"{entry['entry_price']:.4f}",
-                    'exit_time':ts,'exit_price':f"{adj_exit:.4f}",
-                    'exit_type':etype,'pnl':f"{pnl:.2f}",
+                    'exit_time':  ts,
+                    'exit_price': f"{adj_exit:.4f}",
+                    'exit_type':  etype,
+                    'pnl':        f"{pnl:.2f}",
                 })
+
+                # remove the position and report EXIT
                 del positions[symbol]
                 return 'EXIT'
 
-    # ─ Entry on 1 h + classifier
-    df = load_history(symbol)
-    if df is None or len(df) < max(params['roc_period'],50,20,14):
+        # **IMPORTANT**: if we still have a position and it did *not* exit, skip entry
         return None
 
+    # ─── ENTRY on 1 h + classifier ────────────────────────────────────────
+    df = load_history(symbol)
+    if df is None or len(df) < max(params['roc_period'], 50, 20, 14):
+        return None
+
+    # compute ROC
     last = df['close'].iat[-1]
-    prev = df['close'].iat[-1-params['roc_period']]
-    roc  = last/prev - 1
+    prev = df['close'].iat[-1 - params['roc_period']]
+    roc  = last / prev - 1
     if roc <= params['threshold']:
         return None
 
-     # ── Build the same features you trained on ────────────────────────────────
+    # build feature vector
+    now = datetime.utcnow()
     feat = pd.DataFrame([{
-        'roc':        roc,
-        'atr20':      df['atr20'].iloc[-1],
-        'rv20':       df['rv20'].iloc[-1],
-        'ma10_50':    df['ma10_50'].iloc[-1],
-        'rsi14':      df['rsi14'].iloc[-1],
-        'vol_spike':  df['vol_spike'].iloc[-1],
+        'roc':       roc,
+        'atr20':     df['atr20'].iat[-1],
+        'rv20':      df['rv20'].iat[-1],
+        'ma10_50':   df['ma10_50'].iat[-1],
+        'rsi14':     df['rsi14'].iat[-1],
+        'vol_spike': df['vol_spike'].iat[-1],
         'hold_hours': params.get('hold_bars', 1),
-        'hour':       df.index[-1].hour,
-        'weekend':    int(df.index[-1].weekday() >= 5),
-        'sl_pct':     params['sl_pct'],
-        'tp_pct':     params['tp_pct'],
+        'hour':      now.hour,
+        'weekend':   int(now.weekday() >= 5),
+        'sl_pct':    params['sl_pct'],
+        'tp_pct':    params['tp_pct'],
     }])
+
     prob = classifier.predict_proba(scaler.transform(feat))[0,1]
     if prob < CLASSIFIER_THRESHOLD:
         return None
 
     # place entry
-    entry_price = last*(1+FEE_RATE+SLIPPAGE_PCT/2)
-    qty         = NOTIONAL/entry_price
-    ts          = datetime.utcnow().isoformat()
+    entry_price = last * (1 + FEE_RATE + SLIPPAGE_PCT/2)
+    qty         = NOTIONAL / entry_price
+    ts          = now.isoformat()
     print(f"{ts} → ENTER {symbol} @ {entry_price:.4f}  roc={roc:.2%}  P={prob:.2f}")
+
     if not DRY_RUN:
-        exchange.create_order(symbol,'market','buy',qty)
+        exchange.create_order(symbol, 'market', 'buy', qty)
 
     positions[symbol] = {
-        'entry_time':  datetime.fromisoformat(ts),
+        'entry_time':  now,
         'entry_price': entry_price,
         'qty':         qty
     }
+
     log_trade({
-        'symbol':symbol,'action':'ENTER','timestamp':ts,
-        'price':f"{entry_price:.4f}",'qty':f"{qty:.6f}",
-        'roc':f"{roc:.4f}",'prob':f"{prob:.2f}",
-        'entry_time':ts,'entry_price':f"{entry_price:.4f}",
-        'exit_time':'','exit_price':'','exit_type':'','pnl':''
+        'symbol':     symbol,
+        'action':     'ENTER',
+        'timestamp':  ts,
+        'price':      f"{entry_price:.4f}",
+        'qty':        f"{qty:.6f}",
+        'roc':        f"{roc:.4f}",
+        'prob':       f"{prob:.2f}",
+        'entry_time': ts,
+        'entry_price':f"{entry_price:.4f}",
+        'exit_time':  '',
+        'exit_price': '',
+        'exit_type':  '',
+        'pnl':        '',
     })
+
     return 'ENTER'
+
 
 # ─────────────── MAIN LOOP ─────────────────────────────────────────────
 
@@ -408,5 +437,6 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
