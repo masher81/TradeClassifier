@@ -242,7 +242,7 @@ joblib.dump(scaler, 'scaler.pkl')
 joblib.dump(model, 'classifier.pkl')
 print("\n→ Saved scaler.pkl and classifier.pkl")
 
-# ─────────────── LIVE TRADING LOOP ────────────────────────────────────
+# ─────────────── LIVE TRADING LOOP (WITH DEBUG OUTPUT) ────────────────────────────────────
 def log_trade(row):
     """Log trade to CSV file"""
     with open(LOG_FILE, 'a', newline='') as f:
@@ -284,8 +284,9 @@ try:
             
             # Fetch recent data
             try:
-                df = fetch_bars(symbol, hours=72)  # Enough for indicators
+                df = load_history(symbol, hours=72)  # Enough for indicators
                 if df is None or len(df) < 50:
+                    print(f"⚠️ {symbol}: Insufficient data ({len(df) if df is not None else 0} bars)")
                     continue
             except Exception as e:
                 print(f"Error fetching {symbol}: {e}")
@@ -298,6 +299,12 @@ try:
                 
             close = df['close'].iloc[-1]
             roc = close / df['close'].iloc[-1-roc_period] - 1
+            
+            # Print detailed debug information
+            print(f"\n{symbol} at {now}:")
+            print(f"• Last ROC: {roc:.2%} (Threshold: {params['threshold']:.2%})")
+            print(f"• Price: {close:.2f} | MA10: {df['ma10'].iloc[-1]:.2f} | RSI: {df['rsi14'].iloc[-1]:.2f}")
+            print(f"• Volatility: ATR20={df['atr20'].iloc[-1]:.2f} RV20={df['rv20'].iloc[-1]:.4f}")
             
             # Check for exits first
             if symbol in positions:
@@ -356,7 +363,7 @@ try:
                     'ma10_50': df['ma10_50'].iloc[-1],
                     'rsi14': df['rsi14'].iloc[-1],
                     'vol_spike': df['vol_spike'].iloc[-1],
-                    'hold_hours': 0,  # Will be updated on exit
+                    'hold_hours': 0,
                     'hour': now.hour,
                     'weekend': int(now.weekday() >= 5),
                     'sl_pct': params['sl_pct'],
@@ -368,12 +375,13 @@ try:
                 Xs = scaler.transform(X)
                 proba = model.predict_proba(Xs)[0, 1]
                 
+                print(f"• Prob: {proba:.2f} (Threshold: {CLASSIFIER_THRESHOLD:.2f})")
+                
                 if proba >= CLASSIFIER_THRESHOLD:
                     entry_price_adj = close * (1 + FEE_RATE + SLIPPAGE_PCT/2)
                     qty = NOTIONAL / entry_price_adj
                     
-                    print(f"{now} → ENTER {symbol} @ {close:.4f} "
-                          f"(ROC: {roc:.2%}, P(profit): {proba:.2f})")
+                    print(f"✅ ENTERING TRADE @ {close:.2f} (Qty: {qty:.4f})")
                     
                     if not DRY_RUN:
                         try:
@@ -398,8 +406,13 @@ try:
                         'entry_time': now.isoformat(),
                         'entry_price': f"{close:.4f}",
                     })
-        
+                else:
+                    print("⛔ Probability below threshold")
+            else:
+                if roc <= params['threshold']:
+                    print(f"⛔ ROC below threshold ({roc:.2%} <= {params['threshold']:.2%})")
+            
         sleep_till_next()
 
 except KeyboardInterrupt:
-    print("\n� Stopped cleanly")
+    print("\n🛑 Stopped cleanly")
