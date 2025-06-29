@@ -171,21 +171,22 @@ def load_history(symbol):
     if symbol in PROCESSED_CACHE:
         cached_time, df = PROCESSED_CACHE[symbol]
         if datetime.utcnow() - cached_time < CACHE_EXPIRY:
-            return df
+            return df if not df.empty else None  # Add empty check
     
     raw_data = fetch_raw_data(symbol)
     if not raw_data:
         return None
     
     df = compute_indicators(raw_data)
-    if df is not None:
+    if df is not None and not df.empty:  # Add empty check
         PROCESSED_CACHE[symbol] = (datetime.utcnow(), df)
-    return df
+        return df
+    return None
 
 # ─────────────── MARKET UTILITIES ──────────────────────────────────────
 def print_market_summary(history):
     """Print quick market overview"""
-    print("\n📊 Market Summary:")
+    print("\n� Market Summary:")
     for sym, df in list(history.items())[:5]:  # Show first 5 symbols
         if len(df) < 2:
             continue
@@ -348,7 +349,7 @@ def train_model():
     joblib.dump(model, 'classifier.pkl')
     
     if DEBUG_MODE:
-        print("\n🔍 Debug Info:")
+        print("\n� Debug Info:")
         print(f"Current ROC Thresholds: {[p['threshold'] for p in BEST.values()][:5]}...")
         print(f"Classifier Threshold: {CLASSIFIER_THRESHOLD}")
         print(f"Sample Features:\n{feat_df.head(3)}")
@@ -401,7 +402,7 @@ def process_symbol(symbol, positions):
                 pnl = (exit_adj - pos['entry_price']) * pos['qty']
                 hold_hours = (now - pos['entry_time']).total_seconds() / 3600
                 
-                print(f"\n🚀 {symbol} EXIT ({exit_type}) @ {exit_price:.4f} "
+                print(f"\n� {symbol} EXIT ({exit_type}) @ {exit_price:.4f} "
                       f"| PnL: {pnl:.2f} | Held: {hold_hours:.1f}h")
                 
                 if not DRY_RUN:
@@ -496,10 +497,11 @@ def live_trading_loop():
     positions = {}
     print(f"\n▶️ Starting live trader (SL/TP version) - Dry run={DRY_RUN}")
     
-    # Initial market snapshot
+    # Initial market snapshot - FIXED VERSION
     initial_data = {}
     for sym in SYMBOLS[:5]:  # Just load a few for the snapshot
-        if df := load_history(sym):
+        df = load_history(sym)
+        if df is not None and not df.empty:  # Proper DataFrame existence check
             initial_data[sym] = df
     print_market_summary(initial_data)
     
@@ -525,11 +527,11 @@ def live_trading_loop():
             elapsed = time.time() - cycle_start
             sleep_time = max(60 - elapsed, 1)
             if VERBOSE: 
-                print(f"💤 Sleeping {sleep_time:.1f}s until next candle")
+                print(f"� Sleeping {sleep_time:.1f}s until next candle")
             time.sleep(sleep_time)
             
     except KeyboardInterrupt:
-        print("\n🛑 Stopped cleanly")
+        print("\n� Stopped cleanly")
 
 if __name__ == "__main__":
     scaler, model = train_model()
