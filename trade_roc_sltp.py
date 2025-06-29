@@ -2,8 +2,12 @@
 """
 trade_roc_sltp.py
 
-1) Fetch historical data, backtest ROC strategy with SL/TP, build features, train classifier
-2) Run live ROC-based trader with SL/TP exits, filtered through trained classifier
+Enhanced version with:
+1) Increased historical data loading (168h default)
+2) Retry logic for failed API calls
+3) Data caching
+4) Parallel data fetching
+5) Better error handling
 """
 
 import os
@@ -12,6 +16,7 @@ import time
 import csv
 import json
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import ccxt
@@ -34,6 +39,8 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() in ('1','true')
 CLASSIFIER_THRESHOLD = float(os.getenv('CLASSIFIER_THRESHOLD', 0.40))
 LOG_FILE = os.getenv('TRADE_LOG_FILE', 'trade_log.csv')
 TIMEFRAME = '1h'
+MIN_DATA_BARS = 100  # Minimum bars required for trading
+HISTORY_HOURS = 168  # 7 days of history
 
 # Load best parameters including SL/TP values
 with open('best_params.json') as f:
@@ -48,6 +55,10 @@ exchange = ccxt.kraken({
 })
 exchange.load_markets()
 
+# ─────────────── DATA CACHE ────────────────────────────────────────────
+DATA_CACHE = {}
+CACHE_EXPIRY = timedelta(minutes=15)  # Refresh cache every 15 minutes
+
 # ─────────────── LOG FILE SETUP ────────────────────────────────────────
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, 'w', newline='') as f:
@@ -58,24 +69,43 @@ if not os.path.exists(LOG_FILE):
             'exit_type', 'pnl', 'hold_hours'
         ])
 
-def load_history(symbol, hours=720):
-    """Fetch historical data and compute indicators"""
+def load_history(symbol, hours=HISTORY_HOURS, max_retries=3):
+    """Fetch historical data with retries and caching"""
+    # Check cache first
+    if symbol in DATA_CACHE:
+        cached_time, df = DATA_CACHE[symbol]
+        if datetime.utcnow() - cached_time < CACHE_EXPIRY:
+            return df
+    
     since = exchange.milliseconds() - int(hours * 3600 * 1000)
     all_bars = []
+    retries = 0
     
-    while True:
+    while retries < max_retries:
         try:
             chunk = exchange.fetch_ohlcv(symbol, TIMEFRAME, since, limit=500)
             if not chunk:
-                break
+                if retries == max_retries - 1:
+                    break
+                retries += 1
+                time.sleep(5)
+                continue
+                
             all_bars += chunk
             since = chunk[-1][0] + 1
             time.sleep(exchange.rateLimit / 1000)
+            
+            # Early exit if we have enough data
+            if len(all_bars) >= MIN_DATA_BARS * 2:  # Get extra for indicators
+                break
+                
         except Exception as e:
-            print(f"Error loading {symbol}: {e}")
-            break
+            print(f"Error loading {symbol} (attempt {retries+1}): {e}")
+            retries += 1
+            time.sleep(10)
     
-    if not all_bars:
+    if not all_bars or len(all_bars) < 50:  # Absolute minimum
+        print(f"⚠️ {symbol}: Insufficient data ({len(all_bars)} bars)")
         return None
     
     df = pd.DataFrame(all_bars, columns=['ts','open','high','low','close','vol'])
@@ -100,6 +130,8 @@ def load_history(symbol, hours=720):
     df['rsi14'] = 100 - 100/(1 + up.rolling(14).mean() / down.rolling(14).mean())
     df['vol_spike'] = df['vol'] / df['vol'].rolling(20).mean()
     
+    # Update cache
+    DATA_CACHE[symbol] = (datetime.utcnow(), df)
     return df.dropna()
 
 def backtest_sltp(df, params):
@@ -166,20 +198,25 @@ def backtest_sltp(df, params):
 
 # ─────────────── MAIN TRAINING LOGIC ────────────────────────────────────
 print(f"→ Fetching historical data for {len(SYMBOLS)} symbols...")
-history = {}
-for sym in tqdm(SYMBOLS, desc='Loading data'):
+
+def init_symbol(symbol):
+    """Parallel data loading function"""
     try:
-        # Load ~30 days of data for training (720 hours)
-        history[sym] = load_history(sym, hours=720)  
+        df = load_history(symbol, hours=HISTORY_HOURS)
+        return symbol, df
     except Exception as e:
-        print(f"⚠️ Failed {sym}: {e}")
+        print(f"⚠️ Failed {symbol}: {e}")
+        return symbol, None
+
+# Parallel data loading
+with ThreadPoolExecutor(max_workers=5) as executor:
+    results = list(tqdm(executor.map(init_symbol, SYMBOLS), total=len(SYMBOLS)))
+
+history = {sym: df for sym, df in results if df is not None and len(df) >= MIN_DATA_BARS}
 
 # Backtest all symbols with SL/TP to collect trades
 all_trades = []
-for symbol in tqdm(SYMBOLS, desc='Backtesting'):
-    if symbol not in history or history[symbol] is None:
-        continue
-    
+for symbol in tqdm(history.keys(), desc='Backtesting'):
     params = BEST[symbol]
     trades = backtest_sltp(history[symbol], params)
     if not trades.empty:
@@ -242,7 +279,7 @@ joblib.dump(scaler, 'scaler.pkl')
 joblib.dump(model, 'classifier.pkl')
 print("\n→ Saved scaler.pkl and classifier.pkl")
 
-# ─────────────── LIVE TRADING LOOP (WITH DEBUG OUTPUT) ────────────────────────────────────
+# ─────────────── LIVE TRADING LOOP ────────────────────────────────────
 def log_trade(row):
     """Log trade to CSV file"""
     with open(LOG_FILE, 'a', newline='') as f:
@@ -277,16 +314,23 @@ try:
         now = datetime.utcnow()
         print(f"\n[{now}] Open positions: {len(positions)}")
         
+        # Refresh cache periodically
+        if now.minute % 15 == 0:
+            DATA_CACHE.clear()
+        
         for symbol in tqdm(SYMBOLS, desc='Checking symbols'):
             params = BEST.get(symbol)
             if not params:
                 continue
             
-            # Fetch recent data
+            # Fetch data with minimum bar requirement
             try:
-                df = load_history(symbol, hours=72)  # Enough for indicators
-                if df is None or len(df) < 50:
-                    print(f"⚠️ {symbol}: Insufficient data ({len(df) if df is not None else 0} bars)")
+                df = load_history(symbol, hours=HISTORY_HOURS)
+                if df is None or len(df) < MIN_DATA_BARS:
+                    continue
+                    
+                # Skip illiquid pairs
+                if df['vol'].mean() < 100:
                     continue
             except Exception as e:
                 print(f"Error fetching {symbol}: {e}")
