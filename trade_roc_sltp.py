@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-trade_roc_sltp_full.py
+trade_roc_2res_full.py
 
 2-resolution live trader:
   • 1 h ROC + classifier filter for entries
@@ -270,7 +270,7 @@ def print_market_summary():
             pct = (last/prev -1)*100
             vol = df['vol'].iloc[-1]
             snapshot[sym] = (last,pct,vol)
-    print("\n📊 Market Summary (1 h bars):")
+    print("\n� Market Summary (1 h bars):")
     for s,(p,pc,v) in snapshot.items():
         print(f"  {s:8} {p:.4f} ({pc:+.2f}%)  Vol={v:.0f}")
 
@@ -329,16 +329,18 @@ def process_symbol(symbol):
     if roc <= params['threshold']:
         return None
 
-    feat = pd.DataFrame([{
+     feat = pd.DataFrame([{
         'roc':       roc,
-        'atr20':     df['atr20'].iat[-1],
-        'rv20':      df['rv20'].iat[-1],
-        'ma10_50':   df['ma10_50'].iat[-1],
-        'rsi14':     df['rsi14'].iat[-1],
-        'vol_spike': df['vol_spike'].iat[-1],
-        'hold_hrs':  params.get('hold_bars',1),
-        'hour':      df.index[-1].hour,
-        'weekend':   int(df.index[-1].weekday()>=5),
+        'atr20':     df['atr20'].iloc[-1],
+        'rv20':      df['rv20'].iloc[-1],
+        'ma10_50':   df['ma10_50'].iloc[-1],
+        'rsi14':     df['rsi14'].iloc[-1],
+        'vol_spike': df['vol_spike'].iloc[-1],
+        'hold_hours': params.get('hold_bars', 1),  # match trainer name
+        'hour':      now.hour,
+        'weekend':   int(now.weekday() >= 5),
+        'sl_pct':    params['sl_pct'],             # include them
+        'tp_pct':    params['tp_pct'],
     }])
     prob = classifier.predict_proba(scaler.transform(feat))[0,1]
     if prob < CLASSIFIER_THRESHOLD:
@@ -399,9 +401,10 @@ def main():
             time.sleep(max(secs,1))
 
     except KeyboardInterrupt:
-        print("\n📴  Stopping cleanly…")
+        print("\n�  Stopping cleanly…")
         save_persistent_cache()
         save_positions(positions)
 
 if __name__=="__main__":
     main()
+
