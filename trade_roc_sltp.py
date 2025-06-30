@@ -10,9 +10,12 @@ Preserves:
   – verbose/logging/market snapshot
   – ThreadPoolExecutor
   – persistent open positions across restarts
+Enhancements:
+  – detailed open-positions table
+  – non-blocking manual-exit prompt (3 s timeout)
 """
 
-import os, sys, time, csv, json
+import os, sys, time, csv, json, select
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -97,22 +100,14 @@ def show_open_positions():
     print("-" * len(header))
 
     for sym, pos in positions.items():
-        # get whatever price fields exist
-        raw       = pos.get('raw_entry_price',
-                      pos.get('entry_price',
-                      None))
-        cost_basis= pos.get('cost_basis',
-                      (raw * (1 + FEE_RATE + SLIPPAGE_PCT/2) if raw is not None else None))
-        qty       = pos.get('qty', float('nan'))
-
-        # fetch last 5m close
+        raw        = pos.get('raw_entry_price', pos.get('entry_price', float('nan')))
+        cost_basis = pos.get('cost_basis', raw * (1 + FEE_RATE + SLIPPAGE_PCT/2))
+        qty        = pos.get('qty', float('nan'))
         t5, price5 = fetch_latest_5m(sym)
-        price5 = price5 if price5 is not None else float('nan')
-
-        # compute levels
-        tp_lvl = (raw * (1 + BEST[sym]['tp_pct'])) if raw is not None else float('nan')
-        sl_lvl = (raw * (1 - BEST[sym]['sl_pct'])) if raw is not None else float('nan')
-        pnl    = ((price5 - cost_basis) * qty) if cost_basis is not None else float('nan')
+        price5     = price5 if price5 is not None else float('nan')
+        tp_lvl     = raw * (1 + BEST[sym]['tp_pct'])
+        sl_lvl     = raw * (1 - BEST[sym]['sl_pct'])
+        pnl        = (price5 - cost_basis) * qty
 
         print(
             f"{sym:<10} "
@@ -135,22 +130,18 @@ def manual_exit(symbol: str):
         print(f"❌ No open position for {symbol}")
         return
 
-    entry     = positions[symbol]
-    raw       = entry.get('raw_entry_price',
-                entry.get('entry_price',
-                None))
-    cost_basis= entry.get('cost_basis',
-                (raw * (1 + FEE_RATE + SLIPPAGE_PCT/2) if raw is not None else None))
-    qty       = entry.get('qty', 0.0)
+    entry      = positions[symbol]
+    raw        = entry.get('raw_entry_price', entry.get('entry_price', None))
+    cost_basis = entry.get('cost_basis', raw * (1 + FEE_RATE + SLIPPAGE_PCT/2))
+    qty        = entry.get('qty', 0.0)
 
-    # fetch a fresh 5m price
     _, price5 = fetch_latest_5m(symbol)
     if price5 is None:
         print(f"❌ Could not fetch latest price for {symbol}, aborting manual exit.")
         return
 
     exit_price = price5 * (1 - FEE_RATE - SLIPPAGE_PCT/2)
-    pnl        = ((exit_price - cost_basis) * qty) if cost_basis is not None else float('nan')
+    pnl        = (exit_price - cost_basis) * qty
     ts         = datetime.utcnow().isoformat()
 
     print(f"{ts} ← MANUAL EXIT {symbol} @ {exit_price:.4f}  pnl={pnl:.2f}")
@@ -166,13 +157,12 @@ def manual_exit(symbol: str):
         'roc':         '',
         'prob':        '',
         'entry_time':  entry['entry_time'].isoformat(),
-        'entry_price': f"{raw:.4f}" if raw is not None else '',
+        'entry_price': f"{raw:.4f}",
         'exit_time':   ts,
         'exit_price':  f"{exit_price:.4f}",
         'exit_type':   'MANUAL',
         'pnl':         f"{pnl:.2f}",
     })
-
     del positions[symbol]
 
 def load_persistent_cache():
@@ -186,7 +176,7 @@ def load_persistent_cache():
             print(f"♻️ Loaded cache: {len(RAW_CACHE)} raw, {len(PROC_CACHE)} processed")
     except FileNotFoundError:
         if VERBOSE:
-            print("♻️ No cache file, starting fresh")
+            print("♻️ No cache file found – starting fresh")
 
 def save_persistent_cache():
     """Save RAW_CACHE+PROC_CACHE to disk."""
@@ -198,16 +188,11 @@ def validate_cache():
     """Drop any cache entries older than CACHE_EXPIRY."""
     now = datetime.utcnow()
     def prune(d):
-        removed = []
         for k,(ts,_) in list(d.items()):
             if now - ts > CACHE_EXPIRY:
-                removed.append(k)
                 del d[k]
-        return removed
-    r1 = prune(RAW_CACHE)
-    r2 = prune(PROC_CACHE)
-    if VERBOSE and (r1 or r2):
-        print(f"♻️ Cleared expired cache: raw {len(r1)}, proc {len(r2)} symbols")
+    prune(RAW_CACHE)
+    prune(PROC_CACHE)
 
 # ─────────────── RATE LIMIT HELPERS ─────────────────────────────────────
 
@@ -216,9 +201,8 @@ def rate_limited_request():
     """~1 req/sec for public data."""
     global _last_req
     now = time.time()
-    dt  = now - _last_req
-    if dt < 1.0:
-        time.sleep(1.0 - dt)
+    if now - _last_req < 1.0:
+        time.sleep(1.0 - (now - _last_req))
     _last_req = time.time()
 
 # ─────────────── DATA FETCH & INDICATORS ────────────────────────────────
@@ -230,7 +214,8 @@ def fetch_raw_data(symbol):
         ts, data = RAW_CACHE[symbol]
         if now - ts < CACHE_EXPIRY and len(data) >= MIN_DATA_BARS:
             return data
-    since = exchange.milliseconds() - int(HISTORY_HOURS * 3600 * 1000)
+
+    since    = exchange.milliseconds() - int(HISTORY_HOURS * 3600 * 1000)
     all_bars = []
     while True:
         rate_limited_request()
@@ -241,19 +226,20 @@ def fetch_raw_data(symbol):
         since = chunk[-1][0] + 1
         if len(all_bars) >= HISTORY_HOURS + 2:
             break
+
     if all_bars:
         RAW_CACHE[symbol] = (now, all_bars)
     return all_bars if len(all_bars) >= MIN_DATA_BARS else None
 
 def compute_indicators(raw_bars):
-    """Compute all your standard indicators on a list of OHLCV bars."""
+    """Compute your standard indicators on a list of OHLCV bars."""
     df = pd.DataFrame(raw_bars, columns=['ts','open','high','low','close','vol'])
-    df['dt'] = pd.to_datetime(df['ts'], unit='ms')
+    df['dt']       = pd.to_datetime(df['ts'], unit='ms')
     df.set_index('dt', inplace=True)
     df.sort_index(inplace=True)
 
     df['prev_close'] = df['close'].shift(1)
-    df['tr'] = np.maximum.reduce([
+    df['tr']         = np.maximum.reduce([
         df['high'] - df['low'],
         (df['high'] - df['prev_close']).abs(),
         (df['low']  - df['prev_close']).abs(),
@@ -280,40 +266,39 @@ def load_history(symbol):
         ts, df = PROC_CACHE[symbol]
         if now - ts < CACHE_EXPIRY and len(df) >= MIN_DATA_BARS:
             return df
+
     raw = fetch_raw_data(symbol)
     if not raw:
         return None
     df = compute_indicators(raw)
-    if not df.empty:
-        PROC_CACHE[symbol] = (now, df)
-        return df
-    return None
+    PROC_CACHE[symbol] = (now, df)
+    return df
 
 def fetch_latest_5m(symbol):
     """
-    Fetch the latest 5 m bar for `symbol`.
+    Fetch the latest 5m bar for `symbol`.
     Returns (dt:datetime, close:float) or (None,None)
     """
     rate_limited_request()
     bars = exchange.fetch_ohlcv(symbol, EXIT_TIMEFRAME, limit=2)
     if not bars:
-        return None,None
-    df = pd.DataFrame(bars,columns=['ts','o','h','l','c','v'])
-    df['dt'] = pd.to_datetime(df['ts'],unit='ms')
+        return None, None
+    df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
+    df['dt'] = pd.to_datetime(df['ts'], unit='ms')
     df.set_index('dt', inplace=True)
     return df.index[-1].to_pydatetime(), float(df['c'].iloc[-1])
 
 # ─────────────── TRADE LOGGING ──────────────────────────────────────────
 
 if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE,'w',newline='') as f:
+    with open(LOG_FILE,'w', newline='') as f:
         csv.writer(f).writerow([
             'symbol','action','timestamp','price','qty','roc','prob',
             'entry_time','entry_price','exit_time','exit_price','exit_type','pnl'
         ])
 
 def log_trade(row):
-    with open(LOG_FILE,'a',newline='') as f:
+    with open(LOG_FILE,'a', newline='') as f:
         csv.writer(f).writerow([
             row.get('symbol'),
             row.get('action'),
@@ -349,35 +334,34 @@ def save_positions(pos):
     for sym,p in pos.items():
         serial[sym] = {
             'entry_time':   p['entry_time'].isoformat(),
-            'entry_price': p.get('entry_price', p.get('raw_entry_price')),
-            'qty':         p['qty']
+            'entry_price':  p.get('entry_price', p.get('raw_entry_price',0)),
+            'qty':          p['qty']
         }
     with open(POSITIONS_FILE,'w') as f:
-        json.dump(serial,f,indent=2)
+        json.dump(serial, f, indent=2)
 
 # ─────────────── MARKET SUMMARY ─────────────────────────────────────────
 
 def print_market_summary():
-    """Show a quick glance at price + volume for first few symbols."""
     snapshot = {}
     for sym in SYMBOLS[:5]:
         df = load_history(sym)
         if df is not None and len(df) >= 2:
-            last,prev = df['close'].iloc[-1], df['close'].iloc[-2]
-            pct = (last/prev -1)*100
+            last, prev = df['close'].iloc[-1], df['close'].iloc[-2]
+            pct = (last/prev - 1) * 100
             vol = df['vol'].iloc[-1]
-            snapshot[sym] = (last,pct,vol)
-    print("\n� Market Summary (1 h bars):")
+            snapshot[sym] = (last, pct, vol)
+    print("\n� Market Summary (1h bars):")
     for s,(p,pc,v) in snapshot.items():
         print(f"  {s:8} {p:.4f} ({pc:+.2f}%)  Vol={v:.0f}")
 
-# ─────────────── PROCESS ONE SYMBOL ────────────────────────────────────
+# ─────────────── TRADING LOGIC ─────────────────────────────────────────
 
 positions = {}  # symbol → {entry_time,raw_entry_price,cost_basis,entry_price,qty}
 
 def process_symbol(symbol):
     """
-    1) If in a position, check 5m SL/TP exit off the RAW entry price
+    1) If in a position, check 5m SL/TP exit (on raw entry price)
     2) Else, check 1h ROC + classifier entry, then require
        the last 20 x 5m bars to be strictly increasing
     """
@@ -388,12 +372,10 @@ def process_symbol(symbol):
     if symbol in positions:
         t5, close5 = fetch_latest_5m(symbol)
         if t5 is not None and close5 is not None:
-            entry     = positions[symbol]
-            raw_price = entry.get('raw_entry_price',
-                        entry.get('entry_price'))
-            cost_basis= entry.get('cost_basis',
-                        raw_price * (1 + FEE_RATE + SLIPPAGE_PCT/2))
-            qty       = entry['qty']
+            entry      = positions[symbol]
+            raw_price  = entry.get('raw_entry_price', entry.get('entry_price'))
+            cost_basis = entry.get('cost_basis', raw_price * (1 + FEE_RATE + SLIPPAGE_PCT/2))
+            qty        = entry.get('qty', 0)
 
             tp_lvl = raw_price * (1 + params['tp_pct'])
             sl_lvl = raw_price * (1 - params['sl_pct'])
@@ -432,7 +414,7 @@ def process_symbol(symbol):
                 del positions[symbol]
                 return 'EXIT'
 
-        # still in a position, skip any entry logic
+        # still in a position, skip entry logic
         return None
 
     # ─── ENTRY on 1h + classifier ───────────────────────────────────
@@ -513,7 +495,6 @@ def process_symbol(symbol):
 
     return 'ENTER'
 
-
 # ─────────────── MAIN LOOP ─────────────────────────────────────────────
 
 def main():
@@ -532,28 +513,33 @@ def main():
             print(f"\n[{datetime.utcnow().isoformat()}] Open positions: {len(positions)}")
             show_open_positions()
 
-            choice = input("Type a symbol to EXIT manually (or Enter to continue): ").strip().upper()
-            if choice:
-                manual_exit(choice)
-                # after a manual exit we skip the auto‐trade pass for this cycle
-                time.sleep(1)
-                save_persistent_cache()
-                save_positions(positions)
-                continue
+            # non-blocking manual-exit prompt (3s)
+            sys.stdout.write("Type a symbol to EXIT manually (3s)… ")
+            sys.stdout.flush()
+            r,_,_ = select.select([sys.stdin], [], [], 3)
+            if r:
+                choice = sys.stdin.readline().strip().upper()
+                if choice:
+                    manual_exit(choice)
+                    save_persistent_cache()
+                    save_positions(positions)
+                    continue
+            else:
+                print()  # newline if timed out
 
+            # automated trade cycle
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
                 futures = {exe.submit(process_symbol, s): s for s in SYMBOLS}
                 for f in as_completed(futures):
                     f.result()
 
-            # persist cache + positions
             save_persistent_cache()
             save_positions(positions)
 
-            # sleep til next 5 m boundary
+            # sleep til next 5m boundary
             now = datetime.utcnow()
-            secs = 300 - (now.minute%5*60 + now.second)
-            time.sleep(max(secs,1))
+            secs = 300 - (now.minute % 5 * 60 + now.second)
+            time.sleep(max(secs, 1))
 
     except KeyboardInterrupt:
         print("\n📴  Stopping cleanly…")
@@ -562,6 +548,7 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
 
