@@ -280,23 +280,27 @@ positions = {}  # symbol → {entry_time,entry_price,qty}
 
 def process_symbol(symbol):
     """
-    1) If in a position, check 5 m SL/TP exit off the RAW entry price
-    2) Else, check 1 h ROC + classifier entry, then require
-       the last 20 x 5 m bars to be strictly increasing
+    1) If in a position, check 5m SL/TP exit off the RAW entry price
+    2) Else, check 1h ROC + classifier entry, then require
+       the last 20 x 5m bars to be strictly increasing
     """
     global positions
     params = BEST[symbol]
 
-    # ─── EXIT on 5 m ────────────────────────────────────────────────
+    # ─── EXIT on 5m ────────────────────────────────────────────────
     if symbol in positions:
         t5, close5 = fetch_latest_5m(symbol)
         if t5 is not None and close5 is not None:
             entry = positions[symbol]
 
-            # trigger off the raw entry price
-            tp_lvl = entry['raw_entry_price'] * (1 + params['tp_pct'])
-            sl_lvl = entry['raw_entry_price'] * (1 - params['sl_pct'])
-            etype = None
+            # fallback to old entry_price if we haven't migrated yet
+            raw_price   = entry.get('raw_entry_price', entry.get('entry_price'))
+            cost_basis  = entry.get('cost_basis', entry.get('entry_price'))
+            qty         = entry['qty']
+
+            tp_lvl = raw_price * (1 + params['tp_pct'])
+            sl_lvl = raw_price * (1 - params['sl_pct'])
+            etype  = None
 
             if close5 >= tp_lvl:
                 etype = 'TP'
@@ -304,43 +308,42 @@ def process_symbol(symbol):
                 etype = 'SL'
 
             if etype:
-                # compute PnL off the cost_basis (which includes fees/slippage)
                 exit_cost = close5 * (1 - FEE_RATE - SLIPPAGE_PCT/2)
-                pnl       = (exit_cost - entry['cost_basis']) * entry['qty']
+                pnl       = (exit_cost - cost_basis) * qty
                 ts        = t5.isoformat()
                 print(f"{ts} ← EXIT {symbol} @ {exit_cost:.4f} ({etype})  pnl={pnl:.2f}")
 
                 if not DRY_RUN:
-                    exchange.create_order(symbol, 'market', 'sell', entry['qty'])
+                    exchange.create_order(symbol, 'market', 'sell', qty)
 
                 log_trade({
-                    'symbol':     symbol,
-                    'action':     'EXIT',
-                    'timestamp':  ts,
-                    'price':      f"{exit_cost:.4f}",
-                    'qty':        f"{entry['qty']:.6f}",
-                    'roc':        '',
-                    'prob':       '',
-                    'entry_time': entry['entry_time'].isoformat(),
-                    'entry_price':f"{entry['raw_entry_price']:.4f}",
-                    'exit_time':  ts,
-                    'exit_price': f"{exit_cost:.4f}",
-                    'exit_type':  etype,
-                    'pnl':        f"{pnl:.2f}",
+                    'symbol':      symbol,
+                    'action':      'EXIT',
+                    'timestamp':   ts,
+                    'price':       f"{exit_cost:.4f}",
+                    'qty':         f"{qty:.6f}",
+                    'roc':         '',
+                    'prob':        '',
+                    'entry_time':  entry['entry_time'].isoformat(),
+                    'entry_price': f"{raw_price:.4f}",
+                    'exit_time':   ts,
+                    'exit_price':  f"{exit_cost:.4f}",
+                    'exit_type':   etype,
+                    'pnl':         f"{pnl:.2f}",
                 })
 
                 del positions[symbol]
                 return 'EXIT'
 
-        # still in a live position, don't re-enter
+        # still in a position, skip any entry logic
         return None
 
-    # ─── ENTRY on 1 h + classifier ───────────────────────────────────
+    # ─── ENTRY on 1h + classifier ───────────────────────────────────
     df = load_history(symbol)
     if df is None or len(df) < max(params['roc_period'], 50, 20, 14):
         return None
 
-    # 1 h ROC filter
+    # 1h ROC filter
     last = df['close'].iat[-1]
     prev = df['close'].iat[-1 - params['roc_period']]
     roc  = last / prev - 1
@@ -366,7 +369,7 @@ def process_symbol(symbol):
     if prob < CLASSIFIER_THRESHOLD:
         return None
 
-    # ─── 20×5 m monotonicity check ────────────────────────────────────
+    # ─── 20×5m monotonicity check ────────────────────────────────────
     rate_limited_request()
     bars5 = exchange.fetch_ohlcv(symbol, EXIT_TIMEFRAME, limit=20)
     if not bars5 or len(bars5) < 20:
@@ -374,7 +377,7 @@ def process_symbol(symbol):
     closes5 = [b[4] for b in bars5]
     if any(closes5[i] < closes5[i - 1] for i in range(1, len(closes5))):
         if VERBOSE:
-            print(f"⛔ {symbol}: skipped entry, 5 m prices not strictly rising")
+            print(f"⛔ {symbol}: skipped entry, 5m prices not strictly rising")
         return None
 
     # ─── PLACE ENTRY ────────────────────────────────────────────────
@@ -391,6 +394,7 @@ def process_symbol(symbol):
         'entry_time':       now,
         'raw_entry_price':  raw_entry_price,
         'cost_basis':       cost_basis,
+        'entry_price':      raw_entry_price,
         'qty':              qty
     }
 
@@ -411,6 +415,7 @@ def process_symbol(symbol):
     })
 
     return 'ENTER'
+
 
 
 
@@ -454,6 +459,7 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
 
