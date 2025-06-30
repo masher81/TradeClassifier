@@ -1,88 +1,205 @@
-# Kraken ROC-SL/TP Trading System
+# 2-Resolution Live Trading Bot (`trade_roc_sltp_full.py`)
 
-![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
+A Python-based live cryptocurrency trading bot that combines a **1-hour ROC + machine-learning classifier** filter for entries with **5-minute SL/TP** exits. It includes:
 
-A machine learning-enhanced trading system for Kraken exchange that uses:
-- **Rate of Change (ROC)** for entry signals
-- **Stop-Loss/Take-Profit (SL/TP)** for exits
-- **Random Forest Classifier** to filter trades
+- **Raw + processed caching** of 1 h OHLCV data
+- **5 m bar** checks for stop-loss / take-profit exits
+- **Persistent open-positions** across restarts
+- **Manual exit** prompt with a non-blocking timeout
+- **Detailed position reporting** and CSV trade logging
+- **ThreadPoolExecutor** for parallel symbol processing
 
-## System Components
+---
 
-### 1. `generate_best_params.py`
-Brute-force optimizer that finds optimal parameters for all Kraken USD pairs.
+## Table of Contents
 
-### 2. `trade_roc_sltp.py`
-Live trading bot using the optimized parameters with ML filtering.
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [How It Works](#how-it-works)
+- [Key Components](#key-components)
+- [Customization](#customization)
+- [Logging & Data](#logging--data)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
 
 ## Features
 
-- 🚀 **Automated parameter optimization** for each trading pair
-- ⚖️ **Risk-managed exits** with dynamic SL/TP levels
-- 🤖 **ML-powered trade filtering** (Random Forest)
-- 📊 **Comprehensive logging** of all trades
-- 🧪 **Dry-run mode** for testing
-- 📈 **Technical indicators**:
-  - ROC, ATR, RSI, Moving Averages
-  - Realized volatility, volume spikes
+- **2-Resolution Logic**  
+  - **Entry**: 1 h ROC filter + RandomForest classifier  
+  - **Exit**: 5 m SL/TP based on raw entry price  
+- **Caching**:  
+  - Raw 1 h OHLCV and processed indicator DataFrames, refreshed every 30 m  
+- **Parallel Processing**:  
+  - Multi-threaded symbol evaluation (configurable `MAX_WORKERS`)  
+- **Persistence**:  
+  - Open positions saved to `positions.json`  
+  - Cache saved to `data_cache.pkl`  
+- **Manual Exit**:  
+  - Type a symbol to exit manually, with a 3 s non-blocking prompt  
+- **Detailed Reporting**:  
+  - Market snapshot (first 5 symbols)  
+  - Detailed open-positions table, current P/L, TP/SL levels  
+- **Dry-Run Mode**:  
+  - Set `DRY_RUN=true` to simulate without real orders  
+
+---
+
+## Requirements
+
+- Python 3.8+
+- [ccxt](https://github.com/ccxt/ccxt)
+- pandas, numpy
+- scikit-learn
+- python-dotenv
+- joblib
+- tqdm
+
+---
 
 ## Installation
 
-# 1. Create a virtual environment
-python3 -m venv trading_env
+1. Clone this repo:
+   ```bash
+   git clone https://github.com/yourusername/trade-roc-sltp-bot.git
+   cd trade-roc-sltp-bot
+Create & activate a virtual environment:
 
-# 2. Activate it
-source trading_env/bin/activate  # Linux/macOS
-# trading_env\Scripts\activate  # Windows (PowerShell)
+python3 -m venv venv
+source venv/bin/activate
 
-# 3. Now install packages safely
-pip install ccxt numpy pandas scikit-learn joblib tqdm python-dotenv
-python generate_best_params.py
-Outputs: best_params.json
+Install dependencies:
+pip install -r requirements.txt
 
-Optimization Process:
+Configuration
 
-Tests 150+ parameter combinations per pair
+Copy  arb.env and set your credentials & parameters:
 
-Uses 1 year of hourly data
+KRAKEN_APIKEY=your_api_key
+KRAKEN_SECRET=your_api_secret
+NOTIONAL=10000
+FEE_RATE=0.001
+SLIPPAGE_PCT=0.0005
+CLASSIFIER_THRESHOLD=0.40
+DRY_RUN=true
+TRADE_LOG_FILE=trade_log.csv
 
-Maximizes Sharpe ratio
+Place your trained scaler.pkl, classifier.pkl, and best_params.json in the project root.
 
-python trade_roc_sltp.py
-Live Trading Features:
+Usage
+Train your model (if not done already):
 
-Runs hourly checks
 
-Logs trades to trade_log.csv
+python3 trainer.py
+Outputs scaler.pkl & classifier.pkl
 
-Classifier filters trades (adjust threshold in .env)
+Start live trading:
 
-Manages open positions with SL/TP
-File Structure
-├── .env                     # Configuration
-├── best_params.json         # Optimized parameters (generated)
-├── trade_log.csv            # Trade history (generated)
-├── scaler.pkl               # Feature scaler (generated)
-├── classifier.pkl           # Trained model (generated)
-├── generate_best_params.py  # Parameter optimizer
-├── trade_roc_sltp.py        # Main trading bot
-└── README.md                # This file
 
-Technical Indicators
-Indicator	Description	Usage
-ROC	Rate of Change	Entry signal
-ATR(20)	Average True Range	Volatility measure
-RSI(14)	Relative Strength Index	Overbought/oversold
-MA10-MA50	Moving Average Spread	Trend direction
-RV20	20-period Realized Volatility	Risk assessment
+python3 trade_roc_sltp_full.py
+On each 5 m cycle you will see:
 
-Requirements
+Market summary (1 h bars)
 
-ccxt==4.2.85
-numpy==1.26.0
-pandas==2.1.0
-scikit-learn==1.3.0
-joblib==1.3.1
-tqdm==4.66.1
-python-dotenv==1.0.0
+Number of open positions
+
+Detailed open-positions table
+
+3 s prompt to enter a symbol for manual exit
+
+Automated entry/exit processing
+
+How It Works
+Cache & Indicators
+
+Fetches 1 h OHLCV for each symbol into RAW_CACHE.
+
+Computes indicators (ATR, RV, MA, RSI, volume spike) into PROC_CACHE.
+
+Entry Logic
+
+Calculate 1 h ROC over a symbol-specific period.
+
+If ROC > threshold, run RF classifier on latest features.
+
+If proba ≥ CLASSIFIER_THRESHOLD, verify that the last 20×5 m closes are strictly increasing.
+
+Place market buy at adjusted cost basis, record raw entry price & cost basis.
+
+Exit Logic
+
+For each open position, fetch latest 5 m close.
+
+If price ≥ raw_entry_price×(1+tp_pct) → TP, or ≤ raw_entry_price×(1−sl_pct) → SL, place market sell.
+
+P/L is computed vs. cost basis.
+
+Manual Exit
+
+Non-blocking 3 s prompt. If you type a symbol (e.g. BTC/USD), a manual market sell is executed.
+
+Key Components
+process_symbol(symbol)
+Entry/exit logic per symbol
+
+show_open_positions()
+Prints table of open positions & their P/L, TP/SL levels
+
+manual_exit(symbol)
+Force-exit any open position via market sell
+
+Cache Functions
+
+fetch_raw_data / compute_indicators
+
+fetch_latest_5m
+
+Persistence
+
+load_positions() / save_positions()
+
+load_persistent_cache() / save_persistent_cache()
+
+Customization
+Timeframes
+
+ENTRY_TIMEFRAME (default 1h)
+
+EXIT_TIMEFRAME (default 5m)
+
+Thresholds & Periods
+
+Per-symbol in best_params.json (roc_period, threshold, sl_pct, tp_pct)
+
+Classifier
+
+Retrain frequency is up to you (e.g. weekly/monthly)
+
+Concurrency
+
+MAX_WORKERS controls parallelism
+
+Logging & Data
+Trade log: trade_log.csv
+Records every ENTER & EXIT with timestamp, price, qty, P/L
+
+Cache file: data_cache.pkl
+Persists raw & processed OHLCV between runs
+
+Positions file: positions.json
+Persists open-position state across restarts
+
+Troubleshooting
+HTTP 502 / Exchange Not Available
+Kraken public endpoints occasionally return 502. The bot backs off automatically, but you may need to restart on prolonged outages.
+
+Missing Feature-Name Errors
+If retraining changes feature names, re-run trainer.py and restart the bot with fresh scaler.pkl & classifier.pkl.
+
+“No open positions” KeyErrors
+Make sure your positions.json matches the expected schema (raw_entry_price, entry_price, qty, entry_time, cost_basis).
+
