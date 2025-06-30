@@ -280,13 +280,14 @@ positions = {}  # symbol → {entry_time,entry_price,qty}
 
 def process_symbol(symbol):
     """
-    1) If in a position, check 5 m SL/TP exit
-    2) Else, check 1 h ROC + classifier entry
+    1) If in a position, check 5m SL/TP exit
+    2) Else, check 1h ROC + classifier entry, then require
+       the last 20 x 5m bars to be strictly increasing
     """
     global positions
     params = BEST[symbol]
 
-    # ─── EXIT on 5 m ──────────────────────────────────────────────────────
+    # ─── EXIT on 5m ────────────────────────────────────────────────
     if symbol in positions:
         t5, close5 = fetch_latest_5m(symbol)
         if t5 is not None and close5 is not None:
@@ -325,26 +326,25 @@ def process_symbol(symbol):
                     'pnl':        f"{pnl:.2f}",
                 })
 
-                # remove the position and report EXIT
                 del positions[symbol]
                 return 'EXIT'
 
-        # **IMPORTANT**: if we still have a position and it did *not* exit, skip entry
+        # if still in a position, don’t try to re-enter
         return None
 
-    # ─── ENTRY on 1 h + classifier ────────────────────────────────────────
+    # ─── ENTRY on 1h + classifier ───────────────────────────────────
     df = load_history(symbol)
     if df is None or len(df) < max(params['roc_period'], 50, 20, 14):
         return None
 
-    # compute ROC
+    # 1h ROC filter
     last = df['close'].iat[-1]
     prev = df['close'].iat[-1 - params['roc_period']]
     roc  = last / prev - 1
     if roc <= params['threshold']:
         return None
 
-    # build feature vector
+    # classifier
     now = datetime.utcnow()
     feat = pd.DataFrame([{
         'roc':       roc,
@@ -359,12 +359,22 @@ def process_symbol(symbol):
         'sl_pct':    params['sl_pct'],
         'tp_pct':    params['tp_pct'],
     }])
-
     prob = classifier.predict_proba(scaler.transform(feat))[0,1]
     if prob < CLASSIFIER_THRESHOLD:
         return None
 
-    # place entry
+    # ─── NEW: 20×5m monotonicity check ─────────────────────────────
+    rate_limited_request()
+    bars5 = exchange.fetch_ohlcv(symbol, EXIT_TIMEFRAME, limit=20)
+    if not bars5 or len(bars5) < 20:
+        return None
+    closes5 = [b[4] for b in bars5]
+    if any(closes5[i] < closes5[i-1] for i in range(1, len(closes5))):
+        if VERBOSE:
+            print(f"⛔ {symbol}: skipped entry, 5m prices not strictly rising")
+        return None
+
+    # ─── PLACE ENTRY ────────────────────────────────────────────────
     entry_price = last * (1 + FEE_RATE + SLIPPAGE_PCT/2)
     qty         = NOTIONAL / entry_price
     ts          = now.isoformat()
@@ -396,6 +406,7 @@ def process_symbol(symbol):
     })
 
     return 'ENTER'
+
 
 
 # ─────────────── MAIN LOOP ─────────────────────────────────────────────
@@ -437,6 +448,7 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
 
