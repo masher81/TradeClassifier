@@ -240,7 +240,7 @@ def save_positions(pos):
 
 positions={}  # symbol -> {entry_time,raw_entry_price,cost_basis,qty,...}
 
-dfrom ccxt.base.errors import BadSymbol
+
 
 def show_open_positions():
     """
@@ -560,6 +560,7 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
 
