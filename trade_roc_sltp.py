@@ -25,11 +25,12 @@ import pandas as pd
 import ccxt
 import joblib
 import websockets
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from dotenv import load_dotenv
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from ccxt.base.errors import ExchangeNotAvailable, NetworkError
-
+from ccxt.base.errors import BadSymbol
 # ─────────────── CONFIG ─────────────────────────────────────────────────
 
 load_dotenv()
@@ -239,6 +240,8 @@ def save_positions(pos):
 
 positions={}  # symbol -> {entry_time,raw_entry_price,cost_basis,qty,...}
 
+dfrom ccxt.base.errors import BadSymbol
+
 def show_open_positions():
     """
     Print a detailed table of all current positions:
@@ -263,15 +266,25 @@ def show_open_positions():
     print(header)
     print("-" * len(header))
 
-    for sym, pos in positions.items():
+    # iterate over a snapshot so modifications can't break us
+    for sym, pos in list(positions.items()):
         # fall back safely if keys are missing
-        raw       = pos.get('raw_entry_price', pos.get('entry_price', float('nan')))
-        basis     = pos.get('cost_basis', raw * (1 + FEE_RATE + SLIPPAGE_PCT/2))
-        qty       = pos.get('qty', float('nan'))
+        raw   = pos.get('raw_entry_price', pos.get('entry_price', float('nan')))
+        basis = pos.get('cost_basis', raw * (1 + FEE_RATE + SLIPPAGE_PCT/2))
+        qty   = pos.get('qty', float('nan'))
 
-        # fetch last 5m close
-        _, price5 = fetch_latest_5m(sym)
-        price5    = price5 if price5 is not None else float('nan')
+        # fetch last 5m close, guard against invalid pairs
+        try:
+            _, price5 = fetch_latest_5m(sym)
+            price5 = price5 if price5 is not None else float('nan')
+        except BadSymbol:
+            if VERBOSE:
+                print(f"⚠️ [{sym}] invalid symbol for 5m fetch, showing NaN price")
+            price5 = float('nan')
+        except Exception as e:
+            if VERBOSE:
+                print(f"⚠️ [{sym}] error fetching 5m price: {e}, showing NaN price")
+            price5 = float('nan')
 
         tp_lvl = raw * (1 + BEST[sym]['tp_pct'])
         sl_lvl = raw * (1 - BEST[sym]['sl_pct'])
@@ -289,6 +302,7 @@ def show_open_positions():
             f"{sl_lvl:8.4f}"
         )
     print()
+
 
 
 def manual_exit(symbol):
@@ -317,36 +331,65 @@ def manual_exit(symbol):
 # ─────────────── LIVE TP MONITOR VIA WEBSOCKET ─────────────────────────
 
 async def live_tp_monitor():
-    uri = "wss://ws.kraken.com"
-    async with websockets.connect(uri) as ws:
-        sub = {"event":"subscribe","subscription":{"name":"ticker"},"pair":SYMBOLS}
-        await ws.send(json.dumps(sub))
-        if VERBOSE:
-            print("� Subscribed to Kraken WS ticker feed for live TP")
-        async for msg in ws:
-            data = json.loads(msg)
-            if not isinstance(data,list) or len(data)<4 or data[2]!="ticker":
-                continue
-            payload = data[1]
-            pair    = data[3]
-            last_px = float(payload["c"][0])
-            if pair in positions:
-                raw = positions[pair]['raw_entry_price']
-                tp  = raw*(1+BEST[pair]['tp_pct'])
-                if last_px >= tp:
-                    p=positions[pair]; qty=p['qty']; basis=p['cost_basis']
-                    ex=last_px*(1-FEE_RATE-SLIPPAGE_PCT/2)
-                    pnl=(ex-basis)*qty; ts=datetime.utcnow().isoformat()
-                    print(f"{ts} ← LIVE TP EXIT {pair} @ {ex:.4f}  pnl={pnl:.2f}")
-                    if not DRY_RUN:
-                        exchange.create_order(pair,'market','sell',qty)
-                    log_trade({
-                      'symbol':pair,'action':'EXIT','timestamp':ts,'price':f"{ex:.4f}",'qty':f"{qty:.6f}",
-                      'roc':'','prob':'','entry_time':p['entry_time'].isoformat(),
-                      'entry_price':f"{raw:.4f}",'exit_time':ts,'exit_price':f"{ex:.4f}",
-                      'exit_type':'TP_LIVE','pnl':f"{pnl:.2f}"
-                    })
-                    del positions[pair]
+    uri = "wss://ws.kraken.com/"
+    while True:
+        try:
+            async with websockets.connect(uri) as ws:
+                sub = {"event": "subscribe", "subscription": {"name": "ticker"}, "pair": SYMBOLS}
+                await ws.send(json.dumps(sub))
+                if VERBOSE:
+                    print("� Subscribed to Kraken WS ticker feed for live TP")
+
+                async for msg in ws:
+                    data = json.loads(msg)
+                    if not isinstance(data, list) or len(data) < 4 or data[2] != "ticker":
+                        continue
+
+                    payload = data[1]
+                    pair    = data[3]
+                    last_px = float(payload["c"][0])
+
+                    if pair in positions:
+                        raw   = positions[pair]["raw_entry_price"]
+                        tp    = raw * (1 + BEST[pair]["tp_pct"])
+                        if last_px >= tp:
+                            p     = positions[pair]
+                            qty   = p["qty"]
+                            basis = p["cost_basis"]
+                            ex    = last_px * (1 - FEE_RATE - SLIPPAGE_PCT/2)
+                            pnl   = (ex - basis) * qty
+                            ts    = datetime.utcnow().isoformat()
+
+                            print(f"{ts} ← LIVE TP EXIT {pair} @ {ex:.4f}  pnl={pnl:.2f}")
+                            if not DRY_RUN:
+                                exchange.create_order(pair, "market", "sell", qty)
+
+                            log_trade({
+                                "symbol":      pair,
+                                "action":      "EXIT",
+                                "timestamp":   ts,
+                                "price":       f"{ex:.4f}",
+                                "qty":         f"{qty:.6f}",
+                                "roc":         "",
+                                "prob":        "",
+                                "entry_time":  p["entry_time"].isoformat(),
+                                "entry_price": f"{raw:.4f}",
+                                "exit_time":   ts,
+                                "exit_price":  f"{ex:.4f}",
+                                "exit_type":   "TP_LIVE",
+                                "pnl":         f"{pnl:.2f}",
+                            })
+                            del positions[pair]
+
+        except (ConnectionClosedOK, ConnectionClosedError) as e:
+            if VERBOSE:
+                print(f"⚠️ WebSocket closed ({e.__class__.__name__}), reconnecting in 5s…")
+            await asyncio.sleep(5)
+
+        except Exception as e:
+            print(f"❌ WebSocket error {type(e).__name__}: {e}, reconnecting in 5s…")
+            await asyncio.sleep(5)
+
 
 # ─────────────── TRADING LOGIC ─────────────────────────────────────────
 
@@ -419,8 +462,8 @@ def process_symbol(symbol):
             return None
 
         rate_limited_request()
-        bars5=exchange.fetch_ohlcv(symbol, EXIT_TIMEFRAME, limit=20)
-        if not bars5 or len(bars5)<20:
+        bars5=exchange.fetch_ohlcv(symbol, EXIT_TIMEFRAME, limit=5)
+        if not bars5 or len(bars5)<5:
             return None
         closes5=[b[4] for b in bars5]
         if any(closes5[i]<closes5[i-1] for i in range(1,len(closes5))):
@@ -517,6 +560,7 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
 
