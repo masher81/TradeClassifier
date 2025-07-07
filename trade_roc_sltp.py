@@ -15,8 +15,9 @@ Enhancements:
   – detailed open-positions table
   – non-blocking manual-exit prompt (3 s timeout)
   – live TP exits via Kraken WebSocket
-  – per‐symbol maker/taker fees from Kraken market metadata
-  – 1 h dollar‐volume filter (5× trade size)
+  – per-symbol maker/taker fees from Kraken market metadata
+  – 1 h dollar-volume filter (5× trade size)
+  – logs maker_fee and taker_fee on every trade
 """
 import os, sys, time, csv, json, select, threading, asyncio
 from datetime import datetime, timedelta
@@ -54,7 +55,7 @@ CACHE_EXPIRY         = timedelta(minutes=30)
 MAX_WORKERS          = 5
 VERBOSE              = True
 
-# ——— dollar‐volume filter: require at least 5× your ticket size in 1 h volume
+# ——— dollar-volume filter: require at least 5× your ticket size in 1 h volume
 VOL_MULTIPLE         = 5
 MIN_DOLLAR_VOLUME    = NOTIONAL * VOL_MULTIPLE  # e.g. $50k for a $10k trade
 
@@ -195,7 +196,8 @@ if not os.path.exists(LOG_FILE):
     with open(LOG_FILE,'w', newline='') as f:
         csv.writer(f).writerow([
             'symbol','action','timestamp','price','qty','roc','prob',
-            'entry_time','entry_price','exit_time','exit_price','exit_type','pnl'
+            'entry_time','entry_price','exit_time','exit_price','exit_type','pnl',
+            'maker_fee','taker_fee'
         ])
 
 def log_trade(row):
@@ -214,6 +216,8 @@ def log_trade(row):
             row.get('exit_price',''),
             row.get('exit_type',''),
             row.get('pnl',''),
+            row.get('maker_fee',''),
+            row.get('taker_fee',''),
         ])
 
 # ─────────────── PERSISTENT POSITIONS ───────────────────────────────────
@@ -267,7 +271,7 @@ def show_open_positions():
             price5   = price5 if price5 is not None else float('nan')
         except BadSymbol:
             price5 = float('nan')
-        except Exception as e:
+        except Exception:
             price5 = float('nan')
         tp_lvl = raw*(1+BEST[sym]['tp_pct'])
         sl_lvl = raw*(1-BEST[sym]['sl_pct'])
@@ -304,6 +308,8 @@ def manual_exit(symbol):
     print(f"{ts} ← MANUAL EXIT {symbol} @ {ex:.4f}  pnl={pnl:.2f}")
     if not DRY_RUN:
         exchange.create_order(symbol,'market','sell',qty)
+    maker = FEES.get(symbol,{}).get('maker', FALLBACK_FEE)
+    taker = fee
     log_trade({
         'symbol':      symbol,
         'action':      'EXIT',
@@ -318,6 +324,8 @@ def manual_exit(symbol):
         'exit_price':  f"{ex:.4f}",
         'exit_type':   'MANUAL',
         'pnl':         f"{pnl:.2f}",
+        'maker_fee':   f"{maker:.4f}",
+        'taker_fee':   f"{taker:.4f}",
     })
     del positions[symbol]
 
@@ -339,19 +347,21 @@ async def live_tp_monitor():
                     pair    = data[3]
                     last_px = float(payload["c"][0])
                     if pair in positions:
-                        raw   = positions[pair]['raw_entry_price']
+                        p     = positions[pair]
+                        raw   = p['raw_entry_price']
                         tp    = raw*(1+BEST[pair]['tp_pct'])
                         if last_px >= tp:
-                            p    = positions[pair]
-                            qty  = p['qty']
-                            basis= p['cost_basis']
-                            fee  = FEES.get(pair,{}).get('taker', FALLBACK_FEE)
-                            ex   = last_px*(1-fee-SLIPPAGE_PCT/2)
-                            pnl  = (ex-basis)*qty
-                            ts   = datetime.utcnow().isoformat()
+                            qty   = p['qty']
+                            basis = p['cost_basis']
+                            fee   = FEES.get(pair,{}).get('taker', FALLBACK_FEE)
+                            ex    = last_px*(1-fee-SLIPPAGE_PCT/2)
+                            pnl   = (ex-basis)*qty
+                            ts    = datetime.utcnow().isoformat()
                             print(f"{ts} ← LIVE TP EXIT {pair} @ {ex:.4f}  pnl={pnl:.2f}")
                             if not DRY_RUN:
                                 exchange.create_order(pair,'market','sell',qty)
+                            maker = FEES.get(pair,{}).get('maker', FALLBACK_FEE)
+                            taker = fee
                             log_trade({
                                 'symbol':      pair,
                                 'action':      'EXIT',
@@ -366,11 +376,13 @@ async def live_tp_monitor():
                                 'exit_price':  f"{ex:.4f}",
                                 'exit_type':   'TP_LIVE',
                                 'pnl':         f"{pnl:.2f}",
+                                'maker_fee':   f"{maker:.4f}",
+                                'taker_fee':   f"{taker:.4f}",
                             })
                             del positions[pair]
-        except (ConnectionClosedOK,ConnectionClosedError) as e:
+        except (ConnectionClosedOK, ConnectionClosedError):
             if VERBOSE:
-                print(f"⚠️ WS closed ({e.__class__.__name__}), reconnecting in 5s…")
+                print("⚠️ WS closed, reconnecting in 5s…")
             await asyncio.sleep(5)
         except Exception as e:
             print(f"❌ WS error {type(e).__name__}: {e}, reconnecting in 5s…")
@@ -388,43 +400,47 @@ def process_symbol(symbol):
             raw   = ent['raw_entry_price']
             basis = ent['cost_basis']
             qty   = ent['qty']
-            tp    = raw*(1+params['tp_pct'])
-            sl    = raw*(1-params['sl_pct'])
+            tp    = raw * (1 + params['tp_pct'])
+            sl    = raw * (1 - params['sl_pct'])
             etype = None
 
             # 5m TP fallback
-            _,c5 = fetch_latest_5m(symbol)
-            if c5 and c5>=tp:
-                etype='TP'
+            _, c5 = fetch_latest_5m(symbol)
+            if c5 and c5 >= tp:
+                etype = 'TP'
             # 1h SL
             df1h = load_history(symbol)
             if df1h is not None:
                 c1h = df1h['close'].iat[-1]
-                if c1h<=sl:
-                    etype='SL'
+                if c1h <= sl:
+                    etype = 'SL'
 
             if etype:
-                fee = FEES.get(symbol,{}).get('taker', FALLBACK_FEE)
-                ex  = (c5 or c1h)*(1-fee-SLIPPAGE_PCT/2)
-                pnl = (ex-basis)*qty
+                fee = FEES.get(symbol, {}).get('taker', FALLBACK_FEE)
+                ex  = (c5 or c1h) * (1 - fee - SLIPPAGE_PCT/2)
+                pnl = (ex - basis) * qty
                 ts  = datetime.utcnow().isoformat()
                 print(f"{ts} ← EXIT {symbol} @ {ex:.4f} ({etype})  pnl={pnl:.2f}")
                 if not DRY_RUN:
-                    exchange.create_order(symbol,'market','sell',qty)
+                    exchange.create_order(symbol, 'market', 'sell', qty)
+                maker = FEES.get(symbol,{}).get('maker', FALLBACK_FEE)
+                taker = fee
                 log_trade({
-                  'symbol':      symbol,
-                  'action':      'EXIT',
-                  'timestamp':   ts,
-                  'price':       f"{ex:.4f}",
-                  'qty':         f"{qty:.6f}",
-                  'roc':         '',
-                  'prob':        '',
-                  'entry_time':  ent['entry_time'].isoformat(),
-                  'entry_price': f"{raw:.4f}",
-                  'exit_time':   ts,
-                  'exit_price':  f"{ex:.4f}",
-                  'exit_type':   etype,
-                  'pnl':         f"{pnl:.2f}",
+                    'symbol':      symbol,
+                    'action':      'EXIT',
+                    'timestamp':   ts,
+                    'price':       f"{ex:.4f}",
+                    'qty':         f"{qty:.6f}",
+                    'roc':         '',
+                    'prob':        '',
+                    'entry_time':  ent['entry_time'].isoformat(),
+                    'entry_price': f"{raw:.4f}",
+                    'exit_time':   ts,
+                    'exit_price':  f"{ex:.4f}",
+                    'exit_type':   etype,
+                    'pnl':         f"{pnl:.2f}",
+                    'maker_fee':   f"{maker:.4f}",
+                    'taker_fee':   f"{taker:.4f}",
                 })
                 del positions[symbol]
                 return 'EXIT'
@@ -435,8 +451,45 @@ def process_symbol(symbol):
         if df is None or len(df) < max(params['roc_period'],50,5,14):
             return None
 
-        # —— NEW: 1 h dollar‐volume filter ——
-        latest_price      = df['close'].iat[-1]
+        # 1h ROC filter
+        last = df['close'].iat[-1]
+        prev = df['close'].iat[-1 - params['roc_period']]
+        roc  = last / prev - 1
+        if roc <= params['threshold']:
+            return None
+
+        # classifier filter
+        now = datetime.utcnow()
+        feat = pd.DataFrame([{
+            'roc':       roc,
+            'atr20':     df['atr20'].iat[-1],
+            'rv20':      df['rv20'].iat[-1],
+            'ma10_50':   df['ma10_50'].iat[-1],
+            'rsi14':     df['rsi14'].iat[-1],
+            'vol_spike': df['vol_spike'].iat[-1],
+            'hold_hours':params.get('hold_bars', 1),
+            'hour':      now.hour,
+            'weekend':   int(now.weekday() >= 5),
+            'sl_pct':    params['sl_pct'],
+            'tp_pct':    params['tp_pct'],
+        }])
+        prob = classifier.predict_proba(scaler.transform(feat))[0,1]
+        if prob < CLASSIFIER_THRESHOLD:
+            return None
+
+        # 5 m strictly-rising filter
+        rate_limited_request()
+        bars5 = exchange.fetch_ohlcv(symbol, EXIT_TIMEFRAME, limit=5)
+        if not bars5 or len(bars5) < 5:
+            return None
+        closes5 = [b[4] for b in bars5]
+        if any(closes5[i] < closes5[i-1] for i in range(1,len(closes5))):
+            if VERBOSE:
+                print(f"⛔ {symbol}: skipped entry, 5m not strictly rising")
+            return None
+
+        # ─── 1 h dollar-volume filter ─────────────────────────
+        latest_price      = last
         latest_base_vol   = df['vol'].iat[-1]
         latest_dollar_vol = latest_price * latest_base_vol
         if latest_dollar_vol < MIN_DOLLAR_VOLUME:
@@ -444,77 +497,45 @@ def process_symbol(symbol):
                 print(f"⛔ {symbol}: skip, 1h volume ${latest_dollar_vol:,.0f} < ${MIN_DOLLAR_VOLUME:,.0f}")
             return None
 
-        # 1h ROC filter
-        last = latest_price
-        prev = df['close'].iat[-1-params['roc_period']]
-        roc  = last/prev - 1
-        if roc <= params['threshold']:
-            return None
-
-        now = datetime.utcnow()
-        feat = pd.DataFrame([{
-            'roc':roc,
-            'atr20':df['atr20'].iat[-1],
-            'rv20':df['rv20'].iat[-1],
-            'ma10_50':df['ma10_50'].iat[-1],
-            'rsi14':df['rsi14'].iat[-1],
-            'vol_spike':df['vol_spike'].iat[-1],
-            'hold_hours':params.get('hold_bars',1),
-            'hour':now.hour,
-            'weekend':int(now.weekday()>=5),
-            'sl_pct':params['sl_pct'],
-            'tp_pct':params['tp_pct'],
-        }])
-        prob = classifier.predict_proba(scaler.transform(feat))[0,1]
-        if prob < CLASSIFIER_THRESHOLD:
-            return None
-
-        rate_limited_request()
-        bars5 = exchange.fetch_ohlcv(symbol, EXIT_TIMEFRAME, limit=5)
-        if not bars5 or len(bars5)<5:
-            return None
-        closes5 = [b[4] for b in bars5]
-        if any(closes5[i]<closes5[i-1] for i in range(1,len(closes5))):
-            if VERBOSE:
-                print(f"⛔ {symbol}: skipped entry, 5m not strictly rising")
-            return None
-
+        # ─── place entry ────────────────────────────────────────
         fee   = FEES.get(symbol,{}).get('taker', FALLBACK_FEE)
         raw   = last
-        basis = last*(1+fee+SLIPPAGE_PCT/2)
-        qty   = NOTIONAL/basis
+        basis = last * (1 + fee + SLIPPAGE_PCT/2)
+        qty   = NOTIONAL / basis
         ts    = now.isoformat()
         print(f"{ts} → ENTER {symbol} @ {basis:.4f}  roc={roc:.2%}  P={prob:.2f}")
         if not DRY_RUN:
-            exchange.create_order(symbol,'market','buy',qty)
-
+            exchange.create_order(symbol, 'market', 'buy', qty)
+        maker = FEES.get(symbol,{}).get('maker', FALLBACK_FEE)
+        taker = fee
         positions[symbol] = {
             'entry_time':      now,
             'raw_entry_price': raw,
             'cost_basis':      basis,
             'qty':             qty,
         }
-
         log_trade({
-          'symbol':      symbol,
-          'action':      'ENTER',
-          'timestamp':   ts,
-          'price':       f"{basis:.4f}",
-          'qty':         f"{qty:.6f}",
-          'roc':         f"{roc:.4f}",
-          'prob':        f"{prob:.2f}",
-          'entry_time':  ts,
-          'entry_price': f"{raw:.4f}",
-          'exit_time':   '',
-          'exit_price':  '',
-          'exit_type':   '',
-          'pnl':         '',
+            'symbol':      symbol,
+            'action':      'ENTER',
+            'timestamp':   ts,
+            'price':       f"{basis:.4f}",
+            'qty':         f"{qty:.6f}",
+            'roc':         f"{roc:.4f}",
+            'prob':        f"{prob:.2f}",
+            'entry_time':  ts,
+            'entry_price': f"{raw:.4f}",
+            'exit_time':   '',
+            'exit_price':  '',
+            'exit_type':   '',
+            'pnl':         '',
+            'maker_fee':   f"{maker:.4f}",
+            'taker_fee':   f"{taker:.4f}",
         })
         return 'ENTER'
 
-    except (ExchangeNotAvailable,NetworkError) as e:
+    except (ExchangeNotAvailable, NetworkError):
         if VERBOSE:
-            print(f"⚠️ [{symbol}] exchange issue, skipping: {e}")
+            print(f"⚠️ [{symbol}] exchange issue, skipping")
         return None
     except Exception as e:
         print(f"❌ [{symbol}] error: {type(e).__name__} {e}")
@@ -525,7 +546,8 @@ def print_market_summary():
     print("\n� Market Summary (1h bars):")
     for sym in SYMBOLS[:5]:
         df = load_history(sym)
-        if df is None or len(df)<2: continue
+        if df is None or len(df)<2:
+            continue
         last,prev = df['close'].iloc[-1], df['close'].iloc[-2]
         pct =(last/prev-1)*100
         vol = df['vol'].iloc[-1]
@@ -583,6 +605,7 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
 
